@@ -21,11 +21,12 @@ env:
 
 jobs:
   build:
-    runs-on: self-hosted
+    name: Build & Publish (GitHub runner)
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup .NET 9 SDK
+      - name: Setup .NET 9 SDK (Linux)
         uses: actions/setup-dotnet@v4
         with:
           dotnet-version: "9.0.x"
@@ -46,8 +47,9 @@ jobs:
           path: out
 
   deploy:
+    name: Deploy & Swap (Self-hosted IIS)
     needs: build
-    runs-on: self-hosted
+    runs-on: [self-hosted, Windows, X64]
     steps:
       - name: Download artifact
         uses: actions/download-artifact@v4
@@ -87,7 +89,6 @@ jobs:
             throw "Warm-up failed for $url"
           }
 
-          # Determine LIVE by port 80 binding
           $blueLive  = Has-PortBinding $blueSite  $livePort
           $greenLive = Has-PortBinding $greenSite $livePort
 
@@ -113,7 +114,6 @@ jobs:
           Start-Website -Name $targetSite
           Warm-Up "http://localhost:$targetPort/"
 
-          # Swap LIVE binding to target
           foreach ($s in @($blueSite, $greenSite)) {
             $bindings = Get-WebBinding -Name $s -ErrorAction SilentlyContinue |
               Where-Object { $_.bindingInformation -like "*:$($livePort):*" }
