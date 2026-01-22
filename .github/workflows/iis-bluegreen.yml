@@ -1,0 +1,129 @@
+name: IIS Blue-Green Deploy (SimpleWebAppMVC)
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  workflow_dispatch: {}
+
+env:
+  ARTIFACT_NAME: published_app
+
+  BLUE_SITE: myapp-blue
+  GREEN_SITE: myapp-green
+
+  BLUE_PATH: C:\inetpub\myapp\blue
+  GREEN_PATH: C:\inetpub\myapp\green
+  ARTIFACT_PATH: C:\inetpub\myapp\_artifacts\out
+
+  BLUE_PORT: 9081
+  GREEN_PORT: 9082
+  LIVE_PORT: 80
+
+jobs:
+  build:
+    runs-on: self-hosted
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup .NET 9 SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Restore
+        run: dotnet restore SimpleWebAppMVC/SimpleWebAppMVC.csproj
+
+      - name: Build
+        run: dotnet build SimpleWebAppMVC/SimpleWebAppMVC.csproj -c Release --no-restore
+
+      - name: Publish
+        run: dotnet publish SimpleWebAppMVC/SimpleWebAppMVC.csproj -c Release -o out
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: out
+
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ARTIFACT_NAME }}
+          path: ${{ env.ARTIFACT_PATH }}
+
+      - name: Deploy to inactive slot + swap LIVE
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          Import-Module WebAdministration
+
+          $blueSite  = "${{ env.BLUE_SITE }}"
+          $greenSite = "${{ env.GREEN_SITE }}"
+          $bluePath  = "${{ env.BLUE_PATH }}"
+          $greenPath = "${{ env.GREEN_PATH }}"
+          $artifact  = "${{ env.ARTIFACT_PATH }}"
+          $bluePort  = [int]"${{ env.BLUE_PORT }}"
+          $greenPort = [int]"${{ env.GREEN_PORT }}"
+          $livePort  = [int]"${{ env.LIVE_PORT }}"
+
+          function Has-PortBinding($site, $port) {
+            (Get-WebBinding -Name $site -ErrorAction SilentlyContinue |
+              Where-Object { $_.bindingInformation -like "*:$($port):*" }).Count -gt 0
+          }
+
+          function Warm-Up($url) {
+            Write-Host "Warming up: $url"
+            for ($i=1; $i -le 25; $i++) {
+              try {
+                $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
+                if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 500) { return }
+              } catch {}
+              Start-Sleep -Seconds 2
+            }
+            throw "Warm-up failed for $url"
+          }
+
+          # Determine LIVE by port 80 binding
+          $blueLive  = Has-PortBinding $blueSite  $livePort
+          $greenLive = Has-PortBinding $greenSite $livePort
+
+          if ($blueLive) {
+            $targetSite = $greenSite
+            $targetPath = $greenPath
+            $targetPort = $greenPort
+            $oldSite    = $blueSite
+          } else {
+            $targetSite = $blueSite
+            $targetPath = $bluePath
+            $targetPort = $bluePort
+            $oldSite    = $greenSite
+          }
+
+          Write-Host "Deploying to inactive slot: $targetSite"
+          Write-Host "Copy -> $targetPath"
+
+          if (!(Test-Path $targetPath)) { New-Item -ItemType Directory -Force -Path $targetPath | Out-Null }
+          Get-ChildItem -Path $targetPath -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+          Copy-Item -Path "$artifact\*" -Destination $targetPath -Recurse -Force
+
+          Start-Website -Name $targetSite
+          Warm-Up "http://localhost:$targetPort/"
+
+          # Swap LIVE binding to target
+          foreach ($s in @($blueSite, $greenSite)) {
+            $bindings = Get-WebBinding -Name $s -ErrorAction SilentlyContinue |
+              Where-Object { $_.bindingInformation -like "*:$($livePort):*" }
+            foreach ($b in $bindings) {
+              Remove-WebBinding -Name $s -Protocol $b.protocol -BindingInformation $b.bindingInformation
+            }
+          }
+          New-WebBinding -Name $targetSite -Protocol "http" -Port $livePort -IPAddress "*"
+
+          Stop-Website -Name $oldSite -ErrorAction SilentlyContinue
+
+          Warm-Up "http://localhost:$livePort/"
+          Write-Host "✅ LIVE is now: $targetSite"
