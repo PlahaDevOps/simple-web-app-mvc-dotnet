@@ -58,7 +58,7 @@ jobs:
           path: ${{ env.ARTIFACT_PATH }}
 
       - name: Deploy to inactive slot + swap LIVE
-        shell: pwsh
+        shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
           Import-Module WebAdministration
