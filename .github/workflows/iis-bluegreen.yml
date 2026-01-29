@@ -11,7 +11,7 @@ env:
   BLUE_FARM: blue-farm
   GREEN_FARM: green-farm
   LB_SITE: myapp-lb
-  LB_RULE: RouteToActiveFarm   # <-- IMPORTANT: make sure your rule name matches this in myapp-lb
+  LB_RULE: RouteToActiveSlot   # <-- IMPORTANT: make sure your rule name matches this in myapp-lb
 
   BLUE_A_PATH: C:\inetpub\myapp\blue-a
   BLUE_B_PATH: C:\inetpub\myapp\blue-b
@@ -117,7 +117,7 @@ jobs:
 
           function Set-ActiveFarm([string]$farm) {
             Set-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST" -location $lbSite `
-              -filter "system.webServer/rewrite/rules/rule[@name='$lbRule']/action" -name "url" -value "http://$farm/{R:0}" | Out-Null
+              -filter "system.webServer/rewrite/rules/rule[@name='$lbRule']/action" -name "url" -value "http://$farm/{R:1}" | Out-Null
           }
 
           function Deploy-ToPath($path) {
@@ -168,12 +168,12 @@ jobs:
             Set-ActiveFarm $targetFarm
 
             WarmUp200 "http://localhost:$lbPort$health"
-            Write-Host "✅ LIVE farm is now: $targetFarm"
+            Write-Host "[OK] LIVE farm is now: $targetFarm"
           } catch {
-            Write-Host "❌ Swap failed or LB health failed. Rolling back..."
+            Write-Host "[ERROR] Swap failed or LB health failed. Rolling back..."
             Set-ActiveFarm $activeFarm
             WarmUp200 "http://localhost:$lbPort$health"
             throw
           }
 
-          Write-Host "ℹ️ Keeping all instances running for fast rollback."
+          Write-Host "[INFO] Keeping all instances running for fast rollback."
