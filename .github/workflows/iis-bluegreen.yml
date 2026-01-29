@@ -8,16 +8,24 @@ on:
 env:
   ARTIFACT_NAME: published_app
 
-  BLUE_SITE: myapp-blue
-  GREEN_SITE: myapp-green
+  BLUE_FARM: blue-farm
+  GREEN_FARM: green-farm
+  LB_SITE: myapp-lb
+  LB_RULE: RouteToActiveFarm   # <-- IMPORTANT: make sure your rule name matches this in myapp-lb
 
-  BLUE_PATH: C:\inetpub\myapp\blue
-  GREEN_PATH: C:\inetpub\myapp\green
+  BLUE_A_PATH: C:\inetpub\myapp\blue-a
+  BLUE_B_PATH: C:\inetpub\myapp\blue-b
+  GREEN_A_PATH: C:\inetpub\myapp\green-a
+  GREEN_B_PATH: C:\inetpub\myapp\green-b
   ARTIFACT_PATH: C:\inetpub\myapp\_artifacts\out
 
-  BLUE_PORT: 9081
-  GREEN_PORT: 9082
-  LIVE_PORT: 80
+  BLUE_A_HOST: 127.0.0.2
+  BLUE_B_HOST: 127.0.0.3
+  GREEN_A_HOST: 127.0.0.4
+  GREEN_B_HOST: 127.0.0.5
+
+  LB_PORT: 9090
+  HEALTH_PATH: /health
 
 jobs:
   build:
@@ -57,73 +65,115 @@ jobs:
           name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ARTIFACT_PATH }}
 
-      - name: Deploy to inactive slot + swap LIVE
+      - name: Deploy to inactive farm + swap LIVE (ARR Blue/Green)
         shell: powershell
         run: |
+          Set-ExecutionPolicy -ExecutionPolicy Bypass -Scope Process -Force
           $ErrorActionPreference = "Stop"
           Import-Module WebAdministration
 
-          $blueSite  = "${{ env.BLUE_SITE }}"
-          $greenSite = "${{ env.GREEN_SITE }}"
-          $bluePath  = "${{ env.BLUE_PATH }}"
-          $greenPath = "${{ env.GREEN_PATH }}"
-          $artifact  = "${{ env.ARTIFACT_PATH }}"
-          $bluePort  = [int]"${{ env.BLUE_PORT }}"
-          $greenPort = [int]"${{ env.GREEN_PORT }}"
-          $livePort  = [int]"${{ env.LIVE_PORT }}"
+          $blueFarm  = "${{ env.BLUE_FARM }}"
+          $greenFarm = "${{ env.GREEN_FARM }}"
+          $lbSite    = "${{ env.LB_SITE }}"
+          $lbRule    = "${{ env.LB_RULE }}"
+          $lbPort    = [int]"${{ env.LB_PORT }}"
+          $health    = "${{ env.HEALTH_PATH }}"
 
-          function Has-PortBinding($site, $port) {
-            (Get-WebBinding -Name $site -ErrorAction SilentlyContinue |
-              Where-Object { $_.bindingInformation -like "*:$($port):*" }).Count -gt 0
+          $blueAPath  = "${{ env.BLUE_A_PATH }}"
+          $blueBPath  = "${{ env.BLUE_B_PATH }}"
+          $greenAPath = "${{ env.GREEN_A_PATH }}"
+          $greenBPath = "${{ env.GREEN_B_PATH }}"
+          $artifact   = "${{ env.ARTIFACT_PATH }}"
+
+          $blueAHost  = "${{ env.BLUE_A_HOST }}"
+          $blueBHost  = "${{ env.BLUE_B_HOST }}"
+          $greenAHost = "${{ env.GREEN_A_HOST }}"
+          $greenBHost = "${{ env.GREEN_B_HOST }}"
+
+          function Assert-ArrProxyEnabled() {
+            $enabled = (Get-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST" -filter "system.webServer/proxy" -name "enabled").Value
+            if (-not $enabled) { throw "ARR proxy is disabled. Enable it in ARR Server Proxy Settings." }
           }
 
-          function Warm-Up($url) {
-            Write-Host "Warming up: $url"
+          function WarmUp200($url) {
+            Write-Host "Health check: $url"
             for ($i=1; $i -le 25; $i++) {
               try {
                 $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 5
-                if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 500) { return }
+                if ($r.StatusCode -eq 200) { return }
               } catch {}
               Start-Sleep -Seconds 2
             }
-            throw "Warm-up failed for $url"
+            throw "Health check failed (no 200): $url"
           }
 
-          $blueLive  = Has-PortBinding $blueSite  $livePort
-          $greenLive = Has-PortBinding $greenSite $livePort
+          function Get-ActiveFarm() {
+            $url = (Get-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST/$lbSite" `
+              -filter "system.webServer/rewrite/rules/rule[@name='$lbRule']/action" -name "url").Value
 
-          if ($blueLive) {
-            $targetSite = $greenSite
-            $targetPath = $greenPath
-            $targetPort = $greenPort
-            $oldSite    = $blueSite
+            if ($url -match "http://([^/]+)/") { return $matches[1] }
+            throw "Cannot detect active farm from LB rule action url: $url"
+          }
+
+          function Set-ActiveFarm([string]$farm) {
+            Set-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST" -location $lbSite `
+              -filter "system.webServer/rewrite/rules/rule[@name='$lbRule']/action" -name "url" -value "http://$farm/{R:0}" | Out-Null
+          }
+
+          function Deploy-ToPath($path) {
+            if (!(Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
+            Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+            Copy-Item -Path "$artifact\*" -Destination $path -Recurse -Force
+          }
+
+          function Recycle-AppPoolForPath($physicalPath) {
+            $site = Get-Website | Where-Object { $_.physicalPath -ieq $physicalPath } | Select-Object -First 1
+            if (-not $site) { throw "No IIS site found with physicalPath: $physicalPath" }
+            Write-Host "Recycling app pool: $($site.applicationPool) (site: $($site.Name))"
+            Restart-WebAppPool -Name $site.applicationPool
+          }
+
+          # ---- MAIN ----
+          if (!(Test-Path $artifact)) { throw "Artifact path not found: $artifact" }
+
+          Assert-ArrProxyEnabled
+
+          $activeFarm = Get-ActiveFarm
+
+          if ($activeFarm -eq $blueFarm) {
+            $targetFarm  = $greenFarm
+            $targetPaths = @($greenAPath, $greenBPath)
+            $targetHosts = @($greenAHost, $greenBHost)
           } else {
-            $targetSite = $blueSite
-            $targetPath = $bluePath
-            $targetPort = $bluePort
-            $oldSite    = $greenSite
+            $targetFarm  = $blueFarm
+            $targetPaths = @($blueAPath, $blueBPath)
+            $targetHosts = @($blueAHost, $blueBHost)
           }
 
-          Write-Host "Deploying to inactive slot: $targetSite"
-          Write-Host "Copy -> $targetPath"
+          Write-Host "Active farm: $activeFarm"
+          Write-Host "Deploying to inactive farm: $targetFarm"
 
-          if (!(Test-Path $targetPath)) { New-Item -ItemType Directory -Force -Path $targetPath | Out-Null }
-          Get-ChildItem -Path $targetPath -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
-          Copy-Item -Path "$artifact\*" -Destination $targetPath -Recurse -Force
-
-          Start-Website -Name $targetSite
-          Warm-Up "http://localhost:$targetPort/"
-
-          foreach ($s in @($blueSite, $greenSite)) {
-            $bindings = Get-WebBinding -Name $s -ErrorAction SilentlyContinue |
-              Where-Object { $_.bindingInformation -like "*:$($livePort):*" }
-            foreach ($b in $bindings) {
-              Remove-WebBinding -Name $s -Protocol $b.protocol -BindingInformation $b.bindingInformation
-            }
+          foreach ($p in $targetPaths) {
+            Write-Host "Copy -> $p"
+            Deploy-ToPath $p
+            Recycle-AppPoolForPath $p
           }
-          New-WebBinding -Name $targetSite -Protocol "http" -Port $livePort -IPAddress "*"
 
-          Stop-Website -Name $oldSite -ErrorAction SilentlyContinue
+          foreach ($h in $targetHosts) {
+            WarmUp200 "http://$h$health"
+          }
 
-          Warm-Up "http://localhost:$livePort/"
-          Write-Host "✅ LIVE is now: $targetSite"
+          try {
+            Write-Host "Switching LB to: $targetFarm"
+            Set-ActiveFarm $targetFarm
+
+            WarmUp200 "http://localhost:$lbPort$health"
+            Write-Host "✅ LIVE farm is now: $targetFarm"
+          } catch {
+            Write-Host "❌ Swap failed or LB health failed. Rolling back..."
+            Set-ActiveFarm $activeFarm
+            WarmUp200 "http://localhost:$lbPort$health"
+            throw
+          }
+
+          Write-Host "ℹ️ Keeping all instances running for fast rollback."
