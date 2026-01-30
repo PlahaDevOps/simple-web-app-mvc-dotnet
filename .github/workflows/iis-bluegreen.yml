@@ -116,8 +116,10 @@ jobs:
           }
 
           function Set-ActiveFarm([string]$farm) {
-            Set-WebConfigurationProperty -pspath "MACHINE/WEBROOT/APPHOST" -location $lbSite `
-              -filter "system.webServer/rewrite/rules/rule[@name='$lbRule']/action" -name "url" -value "http://$farm/{R:1}" | Out-Null
+            & "$env:windir\system32\inetsrv\appcmd.exe" set config "$lbSite" `
+              -section:system.webServer/rewrite/rules `
+              /[name='$lbRule'].action.url:"http://$farm/{R:1}" `
+              /commit:apphost | Out-Null
           }
 
           function Deploy-ToPath($path) {
