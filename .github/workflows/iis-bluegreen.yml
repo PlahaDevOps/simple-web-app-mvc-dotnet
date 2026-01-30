@@ -124,15 +124,23 @@ jobs:
 
           function Deploy-ToPath($path) {
             if (!(Test-Path $path)) { New-Item -ItemType Directory -Force -Path $path | Out-Null }
+
+            $site = Get-Website | Where-Object { $_.physicalPath -ieq $path } | Select-Object -First 1
+            if ($site) {
+              Write-Host "Stopping app pool: $($site.applicationPool) (site: $($site.Name))"
+              Stop-WebAppPool -Name $site.applicationPool
+              Start-Sleep -Seconds 2
+            } else {
+              Write-Host "No IIS site found with physicalPath: $path"
+            }
+
             Get-ChildItem -Path $path -Force -ErrorAction SilentlyContinue | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
             Copy-Item -Path "$artifact\*" -Destination $path -Recurse -Force
-          }
 
-          function Recycle-AppPoolForPath($physicalPath) {
-            $site = Get-Website | Where-Object { $_.physicalPath -ieq $physicalPath } | Select-Object -First 1
-            if (-not $site) { throw "No IIS site found with physicalPath: $physicalPath" }
-            Write-Host "Recycling app pool: $($site.applicationPool) (site: $($site.Name))"
-            Restart-WebAppPool -Name $site.applicationPool
+            if ($site) {
+              Write-Host "Starting app pool: $($site.applicationPool)"
+              Start-WebAppPool -Name $site.applicationPool
+            }
           }
 
           # ---- MAIN ----
@@ -156,10 +164,12 @@ jobs:
           Write-Host "Deploying to inactive farm: $targetFarm"
 
           foreach ($p in $targetPaths) {
-            Write-Host "Copy -> $p"
+            Write-Host "Deploying to -> $p"
             Deploy-ToPath $p
-            Recycle-AppPoolForPath $p
           }
+
+          Write-Host "Waiting for pools to warm up..."
+          Start-Sleep -Seconds 5
 
           foreach ($h in $targetHosts) {
             WarmUp200 "http://$h$health"
