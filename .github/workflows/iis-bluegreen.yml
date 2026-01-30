@@ -129,7 +129,19 @@ jobs:
             if ($site) {
               Write-Host "Stopping app pool: $($site.applicationPool) (site: $($site.Name))"
               Stop-WebAppPool -Name $site.applicationPool
-              Start-Sleep -Seconds 2
+              $stopped = $false
+              for ($i=1; $i -le 10; $i++) {
+                $state = (Get-WebAppPoolState -Name $site.applicationPool).Value
+                if ($state -eq "Stopped") { $stopped = $true; break }
+                Start-Sleep -Seconds 1
+              }
+              if (-not $stopped) {
+                Write-Host "App pool did not stop cleanly. Forcing worker process stop."
+                $wpLine = & "$env:windir\system32\inetsrv\appcmd.exe" list wp /apppool.name:"$($site.applicationPool)"
+                if ($wpLine -match "PID:(\d+)") {
+                  Stop-Process -Id [int]$matches[1] -Force
+                }
+              }
             } else {
               Write-Host "No IIS site found with physicalPath: $path"
             }
